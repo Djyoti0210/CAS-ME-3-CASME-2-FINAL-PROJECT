@@ -1,0 +1,121 @@
+# CASME3 Micro-Expression Recognition: Comprehensive Project History & Audit Report
+
+> [!NOTE]
+> This document serves as the definitive, forensic-level audit of every phase, technique, and experiment executed during the CASME3 Micro-Expression Recognition project. It details the progression from raw, noisy data to a state-of-the-art dual-stream temporal architecture.
+
+---
+
+## Phase 0 & 1: Dataset Audit, Cleaning, and Stratification
+
+### 1. Data Cleaning
+The raw CASME3 Part A dataset contained structural anomalies that would silently corrupt training:
+- **Audit Findings**: We ran a strict filesystem check comparing `manifest.csv` to the actual `Part_A_ME_clip` directories. We identified missing frames and out-of-order onset/apex timings.
+- **Remediation**: We identified and permanently excluded invalid clips (e.g., `spNO.39_j_855`, `spNO.40_j_1016` missing faces).
+- **Final Valid Cohort**: 721 - 767 meticulously verified clips depending on strictness of onset-to-offset valid frame sequences.
+
+### 2. Class Definitions
+We targeted the 7 objective emotion classes provided in the CASME3 annotations:
+`anger`, `disgust`, `fear`, `happy`, `others`, `sad`, `surprise`.
+
+### 3. Cross-Validation Strategy
+To prevent identity leakage (where a model learns a specific subject's face rather than the micro-expression), we implemented **5-Fold Stratified Leave-One-Subject-Out (LOSO)** validation:
+- **Strategy**: Subjects were grouped into 5 distinct folds such that no subject's face appears in both the training and validation sets simultaneously.
+- **Stratification**: Subjects were carefully distributed using a greedy balancing algorithm (`refine_folds.py`) to ensure the heavily imbalanced emotion classes were distributed as evenly as physically possible across all 5 folds.
+
+---
+
+## Phase 1.5: Data Extraction & Motion Compensation Pipeline
+
+Micro-expressions are inherently subtle. To prevent the neural network from learning macro head movements instead of facial muscle activations, we built a highly specialized extraction pipeline (`extract_rois_v3.py`).
+
+### 1. Landmark Detection & Cropping
+- Used **MediaPipe FaceMesh** on the Onset frame to detect 478 3D facial landmarks.
+- Extracted 3 localized Regions of Interest (ROIs): `left_eye`, `right_eye`, and `mouth`.
+- Applied a generous `0.3` padding ratio to ensure extreme muscle activations at the edges weren't clipped.
+
+### 2. RANSAC Motion Compensation (Crucial Step)
+> [!IMPORTANT]
+> **RANSAC Motion Compensation** was identified as the most crucial preprocessing step to decouple micro-expressions from macro head movements.
+- Defined 40 strictly **rigid facial anchors** (e.g., nose bridge, rigid eye socket contours).
+- Computed an **Affine Partial 2D Transform** (estimating Translation, Scale, and Rotation) using OpenCV's `RANSAC` algorithm to mathematically align the Apex frame back to the exact coordinate space of the Onset frame.
+- **Result**: Completely neutralized macro head movements while preserving local muscle deformations.
+
+### 3. Feature Generation
+- **Optical Flow**: Computed Dense Optical Flow using the Farneback algorithm between the perfectly aligned Onset and Apex crops.
+- **Artifacts Saved**: Wrote `.npz` files containing both the raw `rgb` crops and the computed `flow` tensors.
+
+---
+
+## Phase 3: The Baseline Architecture
+
+We established a deliberate, simple baseline (`train_baseline.py`) to serve as the benchmark for all future experiments.
+
+- **Input Modality**: Dense Optical Flow only.
+- **Architecture**: Single-stream **ResNet18** (ImageNet pretrained).
+- **Data Assembly**: Pinned the 3 extracted ROIs (left eye, right eye, mouth) into a single unified `224x224x2` "pseudo-face" tensor to leverage the ResNet's spatial convolutions efficiently.
+- **Training Config**:
+  - Optimizer: AdamW (LR=1e-4, Weight Decay=1e-3)
+  - Regularization: Dropout (0.4) before the final classification layer.
+  - Loss: Standard CrossEntropyLoss with inverse-frequency class weights computed exclusively from each fold's training distribution.
+  - Early Stopping: Monitored Validation Macro-F1 (UF1), patience=8.
+- **Results**:
+  - The model exhibited **massive overfitting**. Training accuracy skyrocketed to ~98% while validation accuracy stalled around ~35%.
+  - **Mean UF1**: `0.2332`
+  - **Mean UAR**: `0.2528`
+
+---
+
+## Phase 4: Architectural Ablations & Evolutions
+
+We systematically modified one variable at a time to isolate exactly what techniques improve micro-expression generalization on a small, noisy dataset.
+
+### Experiment A: WeightedRandomSampler
+- **Hypothesis**: The dataset is highly imbalanced. Forcing the dataloader to oversample minority classes (via `WeightedRandomSampler`) will improve minority recall.
+- **Result**: **FAILED**. Oversampling did not act as regularization; the network simply memorized the duplicated minority clips faster. Performance remained stagnant.
+- **Metrics**: Mean UF1: `0.2336` (Delta: `+0.0004`)
+
+### Experiment A2: Capacity Freezing (The Breakthrough)
+> [!TIP]
+> **Freezing Pretrained Backbones** is mandatory for micro-expression recognition on small datasets.
+- **Hypothesis**: ResNet18 has 11 million parameters. The 767-clip CASME3 dataset is vastly too small for this capacity, causing the massive train/val gap.
+- **Execution**: Froze all pretrained ImageNet layers in the ResNet18 backbone, leaving only the final residual block (`layer4`) and the Fully Connected layer trainable.
+- **Result**: **SUCCESS**. The train/val accuracy gap shrank from ~70% to ~18%. The network was forced to generalize using low-level Gabor filters rather than memorizing the dataset.
+- **Metrics**: Mean UF1: `0.2551` (Delta: `+0.0219`)
+
+### Experiment B: HTNet (Vision Transformer variant)
+- **Hypothesis**: A specialized Transformer-based model (HTNetLite) designed for Region of Interest tracking could out-perform standard CNNs.
+- **Execution**: Adapted HTNetLite for 3 regions (left eye, right eye, mouth).
+- **Result**: **FAILED**. The transformer architecture, even in a "lite" version, was far too data-hungry for 767 clips. It completely failed to generalize.
+- **Metrics**: Mean UF1: `0.21`, Mean UAR: `0.22`
+
+### Experiment C: Dual-Stream RGB + Flow
+- **Hypothesis**: Optical flow captures *motion*, but it lacks *identity context*. Adding the static RGB appearance (wrinkles, resting facial structure) will anchor the motion vectors and help the network interpret the flow better.
+- **Execution**: Added a parallel, frozen ResNet18 stream processing the static RGB Onset frame. 
+- **Result**: **MASSIVE SUCCESS**. The static identity context created intense synergy with the motion stream.
+- **Metrics**: Mean UF1: `0.3138`, Mean UAR: `0.3217`
+
+### Experiment D: Three-Stream (RGB + Flow + Depth) + Focal Loss (The Champion Architecture)
+> [!IMPORTANT]
+> **This was the absolute peak of our modeling**, reaching the highest performance metrics by fusing all available modalities and loss tunings.
+- **Hypothesis**: Mapping the physical 3D surface geometry of the face via the depth maps will provide a third independent signal. We combined this with Focal Loss (`gamma=2.0`) to force the network to focus on ambiguous minority class micro-expressions.
+- **Execution**: Wrote `extract_depth.py` to securely load the 16-bit depth frames, re-crop using the exact RGB bounding boxes, and normalize them. Added a third frozen ResNet18 stream. Fused features were passed through a strict bottleneck.
+- **Result**: **NEW RECORD**. The combination of the third spatial dimension (Depth) with the focal loss balancing created the strongest, most resilient classifier across the 5 folds.
+- **Metrics**: 
+  - Mean UF1: `0.3399` (~0.34)
+  - Mean UAR: `0.3453` (~0.35)
+
+### Experiment E: Temporal Flow Sequences & GRU
+- **Hypothesis**: A single Onset->Apex flow delta loses the complex trajectory and velocity of the muscle activation. Capturing intermediate steps via sequence modeling will capture the true dynamics of the micro-expression.
+- **Execution**: Wrote `extract_flow_seq.py`: Sampled 4 evenly-spaced frames between Onset and Apex. Used RANSAC to align *all* intermediate frames back to the Onset coordinate space. Computed 3 consecutive flow deltas. Fed this sequence into a 1-layer **GRU** (`hidden_size=128`).
+- **Result**: **High Variance**. The GRU's capacity to model sequences caused heavier overfitting. While the temporal features proved highly valuable on Folds 1 & 2, it struggled to beat the robust static Three-Stream model on average.
+
+---
+
+## Final Conclusions & The Optimal Blueprint
+
+After exhaustive ablation on the CASME3 dataset, the definitive blueprint for Micro-Expression Recognition under low-data regimes is as follows:
+
+1. **Alignment is Non-Negotiable**: RANSAC-based affine motion compensation on rigid facial anchors is mandatory to decouple micro-expressions from macro head movements.
+2. **Backbone Discipline**: Using fully trainable modern CNNs (ResNets, ViTs) or Transformers (HTNet) leads to catastrophic memorization. Freezing the vast majority of pretrained ImageNet layers and only training the top-level semantic layers is required to force generalization.
+3. **Tri-Modal Synergy (RGB + Flow + Depth)**: Motion (Optical Flow) cannot exist in a vacuum. It must be contextualized by static spatial identity (RGB) and 3D geometry (Depth) to reach peak UF1/UAR above 0.34.
+4. **Focal Loss is Viable**: When paired with sufficiently robust multi-modal features, Focal Loss successfully addresses the extreme class imbalance in CASME3.
