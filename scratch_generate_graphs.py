@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 
-ARTIFACTS_DIR = Path(r"C:\Users\sanch\.gemini\antigravity-ide\brain\947c132a-f711-4eae-8af9-db1d39be7e50\artifacts")
+ARTIFACTS_DIR = Path(r"Final project metrics")
 class_names = ['anger', 'disgust', 'fear', 'happy', 'others', 'sad', 'surprise']
 
 def generate_graphs():

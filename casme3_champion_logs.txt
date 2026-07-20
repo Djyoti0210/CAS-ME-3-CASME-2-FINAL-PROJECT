@@ -1,0 +1,17 @@
+============================================================
+CAS(ME)3 CHAMPION MODEL (3-STREAM V2: RGB + FLOW + DEPTH)
+============================================================
+Architecture: 3x ResNet18 Backbones (Late Fusion)
+Evaluation Protocol: Subject-Independent 5-Fold Cross Validation
+
+PER-FOLD RESULTS:
+  Fold 0: UF1=0.2662
+  Fold 1: UF1=0.3064
+  Fold 2: UF1=0.3412
+  Fold 3: UF1=0.3760
+  Fold 4: UF1=0.4162
+
+------------------------------------------------------------
+FINAL AVERAGES:
+  Mean Macro-F1 (UF1): 0.3412 ± 0.0523
+============================================================

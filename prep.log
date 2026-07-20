@@ -1,0 +1,34 @@
+﻿Loading CASME2 static image pool...
+Reading Cropped.zip...
+
+--- Clip Length Check ---
+Class 'happy': 32 clips, 2360 images (Avg 73.8 images/clip)
+Class 'others': 126 clips, 8554 images (Avg 67.9 images/clip)
+Class 'disgust': 63 clips, 4204 images (Avg 66.7 images/clip)
+Class 'surprise': 25 clips, 1605 images (Avg 64.2 images/clip)
+Class 'fear': 2 clips, 127 images (Avg 63.5 images/clip)
+Class 'sad': 7 clips, 274 images (Avg 39.1 images/clip)
+-------------------------
+
+Extracting frames to D:\CASME PROJECT FINAL\CASME2_static_image_pool...
+
+Extraction complete! NOTE: This pretraining stage does NOT have subject-independence guarantees.
+
+=== FINAL CLASS DISTRIBUTION ===
+Class      | Train   | Holdout | Total  
+-----------------------------------
+disgust    | 3612    | 592     | 4204   
+fear       | 127     | 0       | 127    
+happy      | 2055    | 305     | 2360   
+others     | 7178    | 1376    | 8554   
+sad        | 231     | 43      | 274    
+surprise   | 1341    | 264     | 1605   
+-----------------------------------
+TOTAL      | 14544   | 2580    | 17124  
+
+=== ImageFolder & DataLoader Setup Example ===
+transform = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+train_dataset = datasets.ImageFolder('D:\CASME PROJECT FINAL\CASME2_static_image_pool/train', transform=transform)
+holdout_dataset = datasets.ImageFolder('D:\CASME PROJECT FINAL\CASME2_static_image_pool/holdout', transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+holdout_loader = DataLoader(holdout_dataset, batch_size=32, shuffle=False)

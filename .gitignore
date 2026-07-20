@@ -1,4 +1,7 @@
-CASME 2/
+CASME 2 Dataset/
+CASME2_5fold_pool/
+CASME2_static_image_pool/
+CASME2_static_image_pool_backup/
 CASME3_Dataset/
 __pycache__/
 *.pt

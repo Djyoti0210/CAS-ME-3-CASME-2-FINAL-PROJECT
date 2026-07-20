@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import f1_score, recall_score, confusion_matrix, accuracy_score
 
-from dataset import fit_label_map, build_dataloader
+from casme3_dataset import fit_label_map, build_dataloader
 import torchvision.models as models
 
 # --- MODEL DEFINITION ---
@@ -44,7 +44,6 @@ class ThreeStreamModelV2(nn.Module):
 
         fused_dim = rgb_dim + flow_dim + depth_dim # 1536
         
-        # Keep small fusion head pattern from Try1
         self.classifier = nn.Sequential(
             nn.Linear(fused_dim, 128),
             nn.ReLU(inplace=True),
@@ -115,7 +114,6 @@ def plot_learning_curves(history, fold):
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Loss')
     ax1.legend()
-    
     ax1.grid(True, linestyle='--', alpha=0.7)
 
     if 'val_uf1' in history:
@@ -127,23 +125,22 @@ def plot_learning_curves(history, fold):
         ax2.grid(True, linestyle='--', alpha=0.7)
     
     plt.tight_layout()
-    plt.savefig(METRICS_DIR / f"fold_{fold}_learning_curves.png", dpi=150)
+    plt.savefig(METRICS_DIR / f"fold_{fold}_swa_learning_curves.png", dpi=150)
     plt.close()
 
 def plot_confusion_matrix(cm, class_names, fold):
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    plt.title(f'Confusion Matrix - Fold {fold}')
+    plt.title(f'Confusion Matrix (SWA) - Fold {fold}')
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig(METRICS_DIR / f"fold_{fold}_cm.png", dpi=150)
+    plt.savefig(METRICS_DIR / f"fold_{fold}_swa_cm.png", dpi=150)
     plt.close()
 
 def train_epoch(model, loader, criterion, optimizer):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    all_preds, all_labels = [], []
     for rgb, flow, depth, y in tqdm(loader, desc="  train", leave=False):
         rgb, flow, depth, y = rgb.to(DEVICE), flow.to(DEVICE), depth.to(DEVICE), y.to(DEVICE)
         optimizer.zero_grad()
@@ -156,9 +153,6 @@ def train_epoch(model, loader, criterion, optimizer):
         preds = logits.argmax(1)
         correct += (preds == y).sum().item()
         total += y.size(0)
-        
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(y.cpu().numpy())
         
     return total_loss / total, correct / total
 
@@ -186,25 +180,15 @@ def validate(model, loader, criterion):
     return total_loss / total, acc, uf1, uar, all_labels, all_preds
 
 def run_one_fold(fold, df, label_map, epochs, overfit_test=False):
-    if overfit_test:
-        tiny_df = df.sample(n=16, random_state=42).reset_index(drop=True)
-        train_loader = build_dataloader(tiny_df, label_map, batch_size=8, shuffle=True, is_train=False, use_weighted_sampler=False)
-        val_loader = train_loader
-        lr = 1e-3
-    else:
-        train_df = df[df["fold"] != fold].reset_index(drop=True)
-        val_df = df[df["fold"] == fold].reset_index(drop=True)
-        train_loader = build_dataloader(train_df, label_map, batch_size=16, shuffle=True, is_train=True, use_weighted_sampler=False)
-        val_loader = build_dataloader(val_df, label_map, batch_size=16, shuffle=False, is_train=False)
-        lr = 1e-4
+    train_df = df[df["fold"] != fold].reset_index(drop=True)
+    val_df = df[df["fold"] == fold].reset_index(drop=True)
+    train_loader = build_dataloader(train_df, label_map, batch_size=16, shuffle=True, is_train=True, use_weighted_sampler=False)
+    val_loader = build_dataloader(val_df, label_map, batch_size=16, shuffle=False, is_train=False)
+    lr = 1e-4
 
     model = ThreeStreamModelV2(num_classes=len(label_map), dropout=0.4).to(DEVICE)
-    
-    if overfit_test:
-        criterion = nn.CrossEntropyLoss()
-    else:
-        class_weights = compute_class_weights(train_df, label_map, DEVICE)
-        criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+    class_weights = compute_class_weights(train_df, label_map, DEVICE)
+    criterion = FocalLoss(alpha=class_weights, gamma=2.0)
         
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -214,15 +198,22 @@ def run_one_fold(fold, df, label_map, epochs, overfit_test=False):
     best_epoch = 0
     patience = 8
     patience_counter = 0
-    ckpt_path = Path(f"best_threestream_v2_fold{fold}.pt") if not overfit_test else None
 
     history = {'train_loss': [], 'val_loss': [], 'val_uf1': [], 'val_acc': []}
     metrics_log = []
+
+    last_completed_epoch = 0
 
     for epoch in range(1, epochs + 1):
         tr_loss, tr_acc = train_epoch(model, train_loader, criterion, optimizer)
         vl_loss, vl_acc, vl_uf1, vl_uar, val_labels, val_preds = validate(model, val_loader, criterion)
         scheduler.step()
+        
+        last_completed_epoch = epoch
+        
+        # Save every epoch to a temp file for later SWA
+        temp_ckpt = Path(f"swa_temp_fold{fold}_epoch{epoch}.pt")
+        torch.save(model.state_dict(), temp_ckpt)
         
         history['train_loss'].append(tr_loss)
         history['val_loss'].append(vl_loss)
@@ -235,41 +226,67 @@ def run_one_fold(fold, df, label_map, epochs, overfit_test=False):
         })
 
         marker = ""
-        # Monitor on UF1 for early stopping
         if vl_uf1 > best_val_uf1:
             best_val_uf1 = vl_uf1
             best_epoch = epoch
             patience_counter = 0
             best_metrics = {'uf1': vl_uf1, 'uar': vl_uar, 'acc': vl_acc}
-            
-            if ckpt_path:
-                torch.save(model.state_dict(), ckpt_path)
-            
-            class_names = [k for k, v in sorted(label_map.items(), key=lambda x: x[1])]
-            cm = confusion_matrix(val_labels, val_preds, labels=range(len(label_map)))
-            if not overfit_test:
-                plot_confusion_matrix(cm, class_names, fold)
-            
-            marker = "  * saved"
+            marker = "  * best"
         else:
             patience_counter += 1
             
         print(f"Epoch {epoch:3d}/{epochs}  |  train loss={tr_loss:.3f} acc={tr_acc:.3f}  |  val loss={vl_loss:.3f} acc={vl_acc:.3f} uf1={vl_uf1:.3f}{marker}")
         
-        if not overfit_test and patience_counter >= patience:
+        if patience_counter >= patience:
             print(f"Early stopping at epoch {epoch}")
             break
 
-    if not overfit_test:
-        pd.DataFrame(metrics_log).to_csv(METRICS_DIR / f"fold_{fold}_metrics.csv", index=False)
-        plot_learning_curves(history, fold)
+    # --- SWA LOGIC ---
+    print(f"\n--- PERFORMING SWA AROUND PEAK EPOCH {best_epoch} ---")
+    epochs_to_avg = [best_epoch - 1, best_epoch, best_epoch + 1]
+    epochs_to_avg = [e for e in epochs_to_avg if 1 <= e <= last_completed_epoch]
+    
+    print(f"Averaging weights from epochs: {epochs_to_avg}")
+    swa_state_dict = {}
+    for e in epochs_to_avg:
+        sd = torch.load(f"swa_temp_fold{fold}_epoch{e}.pt", map_location=DEVICE, weights_only=True)
+        for k, v in sd.items():
+            if k not in swa_state_dict:
+                swa_state_dict[k] = v.clone() / len(epochs_to_avg)
+            else:
+                swa_state_dict[k] += v.clone() / len(epochs_to_avg)
+                
+    model.load_state_dict(swa_state_dict)
+    
+    # Save the final SWA checkpoint
+    swa_ckpt_path = Path(f"casme3_best_threestream_swa_fold{fold}.pt")
+    torch.save(swa_state_dict, swa_ckpt_path)
+    
+    # Re-evaluate SWA model
+    print("Evaluating SWA Model...")
+    _, _, swa_uf1, swa_uar, swa_labels, swa_preds = validate(model, val_loader, criterion)
+    print(f"SWA UF1: {swa_uf1:.4f} | SWA UAR: {swa_uar:.4f} (Original Best: {best_val_uf1:.4f})")
+    
+    # Delete temp files
+    for e in range(1, last_completed_epoch + 1):
+        temp_ckpt = Path(f"swa_temp_fold{fold}_epoch{e}.pt")
+        if temp_ckpt.exists():
+            temp_ckpt.unlink()
+            
+    best_metrics['swa_uf1'] = swa_uf1
+    best_metrics['swa_uar'] = swa_uar
+    best_metrics['best_epoch'] = best_epoch
+
+    pd.DataFrame(metrics_log).to_csv(METRICS_DIR / f"fold_{fold}_swa_metrics.csv", index=False)
+    plot_learning_curves(history, fold)
+    class_names = [k for k, v in sorted(label_map.items(), key=lambda x: x[1])]
+    cm = confusion_matrix(swa_labels, swa_preds, labels=range(len(label_map)))
+    plot_confusion_matrix(cm, class_names, fold)
         
-    print(f"Best val UF1: {best_val_uf1:.4f} at epoch {best_epoch}")
     return best_metrics
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--overfit_test", action="store_true")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--all_folds", action="store_true")
@@ -296,31 +313,29 @@ def main():
     print("Label map:", label_map)
     print("Device:", DEVICE)
 
-    if args.overfit_test:
-        print("\n=== OVERFIT TEST MODE (Three-Stream V2) ===\n")
-        run_one_fold(0, df, label_map, epochs=args.epochs or 40, overfit_test=True)
-        return
-
     if args.all_folds:
-        print("\n=== ALL FOLDS (Three-Stream V2) ===\n")
+        print("\n=== ALL FOLDS (SWA Champion Retrain) ===\n")
         results = {}
         for fold in sorted(df["fold"].unique()):
             print(f"\n{'='*60}\nFOLD {fold}\n{'='*60}")
             metrics = run_one_fold(fold, df, label_map, epochs=args.epochs or 30)
             results[fold] = metrics
             
-        uf1s = [m['uf1'] for m in results.values()]
-        uars = [m['uar'] for m in results.values()]
+        uf1s = [m['swa_uf1'] for m in results.values()]
+        uars = [m['swa_uar'] for m in results.values()]
         
-        print(f"\n{'='*60}\nFINAL SUMMARY\n{'='*60}")
+        orig_uf1s = [m['uf1'] for m in results.values()]
+        
+        print(f"\n{'='*60}\nFINAL SWA SUMMARY\n{'='*60}")
         for fold, m in results.items():
-            print(f"  Fold {fold}: UF1={m['uf1']:.4f}, UAR={m['uar']:.4f}")
+            print(f"  Fold {fold}: SWA UF1={m['swa_uf1']:.4f} (Original={m['uf1']:.4f}), SWA UAR={m['swa_uar']:.4f}")
         print("-" * 40)
-        print(f"  Mean UF1: {np.mean(uf1s):.4f} ± {np.std(uf1s):.4f}")
-        print(f"  Mean UAR: {np.mean(uars):.4f} ± {np.std(uars):.4f}")
+        print(f"  Mean SWA UF1: {np.mean(uf1s):.4f} ± {np.std(uf1s):.4f}")
+        print(f"  Mean SWA UAR: {np.mean(uars):.4f} ± {np.std(uars):.4f}")
+        print(f"  (Mean Original UF1: {np.mean(orig_uf1s):.4f})")
         print(f"{'='*60}\n")
     else:
-        print(f"\n=== FOLD {args.fold} (Three-Stream V2) ===\n")
+        print(f"\n=== FOLD {args.fold} (SWA Champion Retrain) ===\n")
         run_one_fold(args.fold, df, label_map, epochs=args.epochs or 30)
 
 if __name__ == "__main__":
